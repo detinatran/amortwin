@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.npz
+*.pt
+*.nii.gz
+external/
+results/
+work/
+weights/
+.DS_Store

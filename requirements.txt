@@ -1,0 +1,9 @@
+numpy
+scipy
+torch
+nibabel
+pydicom
+pylibjpeg
+pylibjpeg-libjpeg
+matplotlib
+pyyaml
