@@ -24,12 +24,24 @@ The code is being released step by step together with the paper (in preparation)
 | `scripts/time_amortized.py` | run-time measurement |
 | `scripts/learned_folds24.json` | patient folds of ISLES'24 used for all cross-fitting |
 
+### 2D models
+
+The voxelwise model above is amortized over single curves. The models below work on a whole slice
+cut at `L` seconds and are the ones evaluated across centres.
+
+| file | purpose |
+|---|---|
+| `scripts/cnn_baseline.py` | the 2D U-Net trunk (48/96/192, bottleneck 384) and the curves-only baseline |
+| `scripts/amortwin2d.py` | AmorTwin-2D: the twin's fitted parameters as regression targets, plus inference and evaluation shared by every 2D arm |
+| `scripts/at2d_sae.py` | **AmorTwin-S**: the twin's indicator-dilution model as a fixed, weight-free decoder inside the network; the encoder emits per-pixel (ln MTT, delay, ln CBV) and the decoder rebuilds the observed part of each curve |
+| `scripts/at2d_tta.py` | the decoder's rebuild/AIF-shift helpers, and test-time adaptation baselines |
+| `scripts/mvols_dir.py` | probability-weighted volumes `V = sum_v p(v) w(v)` from a prediction directory |
+
 ## Dependencies
 
 * Python 3.11+, PyTorch, NumPy, SciPy, nibabel (see `requirements.txt`).
-* The physics twin (HemoPIC, extended) in `external/HemoPIC_plus`, and the
-  DuoFusion code (truncation benchmark, data loaders) in `external/duofusion`; both are imported by
-  path from the scripts.
+* The physics twin (extended) in `external/twin`, and the truncation benchmark and data
+  loaders in `external/benchmark`; both are imported by path from the scripts.
 * Data: ISLES'24, ISLES'18 and UniToBrain (public; not redistributed here).
 
 ## Typical run
@@ -39,4 +51,16 @@ python scripts/export_pairs.py <ISLES2024_root> <twin_out> pairs.npz --folds scr
 python scripts/amortized_train.py pairs.npz weights/ --trunc-min 25 --prob --augment
 python scripts/prob_amortwin.py calib pairs.npz weights/ work/
 python scripts/eval_prob_external.py <external_pairs.npz> weights/ work/calib.json out.json
+```
+
+AmorTwin-S, trained on one centre and applied to another without retraining:
+
+```bash
+# train: the symbolic decoder is self-supervised, so --twin-weight 0 uses no twin fit at all
+python scripts/at2d_sae.py train <cnn_dir> <x_dir> scripts/learned_folds24.json work/ \
+    --masks --fold 0 --epochs 60 --rec-weight 1 --twin-weight 0 --seed 0
+
+# apply to a second centre and read out the volumes
+python scripts/at2d_sae.py infer <cnn_dir2> <x_dir2> - work/ --masks --external pred2
+python scripts/mvols_dir.py work/pred2 work/volumes2.json
 ```
