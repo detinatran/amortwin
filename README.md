@@ -37,6 +37,25 @@ cut at `L` seconds and are the ones evaluated across centres.
 | `scripts/at2d_tta.py` | the decoder's rebuild/AIF-shift helpers, and test-time adaptation baselines |
 | `scripts/mvols_dir.py` | probability-weighted volumes `V = sum_v p(v) w(v)` from a prediction directory |
 
+### Encoder variants
+
+`scripts/encoders/` holds alternatives to the plain U-Net, selected with `--arch`. Each keeps the
+trunk of `cnn_baseline` unchanged -- same widths, normalisation, dropout and head -- and alters one
+thing, so a comparison isolates the change rather than the capacity.
+
+| `--arch` | what it changes | hypothesis it tests |
+|---|---|---|
+| `unet` | nothing (default) | — |
+| `tsnet` | attention along time, per pixel, before the trunk | the first conv mixes all 60 frames and loses curve shape |
+| `cbnet` | projection onto a learned gamma-variate basis before the trunk | perfusion curves are low-dimensional, so 12 bases suffice |
+| `duonet` | `ln MTT` emitted as a distribution and sampled for the decoder | a truncated curve does not identify MTT, so a point estimate overstates what is known |
+| `calnet` | learned temperature, a loss on the volume itself, a penalty on undecided probability | the readout is a weighted sum of probabilities, so its error is one of calibration |
+
+```bash
+python scripts/at2d_sae.py train <cnn_dir> <x_dir> scripts/learned_folds24.json work/ \
+    --masks --fold 0 --epochs 60 --twin-weight 0 --arch calnet
+```
+
 ## Dependencies
 
 * Python 3.11+, PyTorch, NumPy, SciPy, nibabel (see `requirements.txt`).

@@ -18,9 +18,6 @@ twin-fitted tissue in the pixel. Training lengths as AmorTwin and the CNN: L ~ U
 the same size drawn from the full scans of the other centre's patients outside test half k (twin targets only, no
 mask loss), cut at random lengths like the source slices; the source batches and the number of steps are unchanged.
 The twin targets need no label, only a twin fit of past full scans of the new centre. The test half k is never seen.
---pseudo <work_dir> (with --adapt-*, for the control): self-training baseline. The target slices get hard pseudo-masks
-from the mask outputs of the source-trained model at2d_fold0.pt of <work_dir> on the full scan (teacher), counted only where
-the teacher is confident (p <= 0.1 or >= 0.9, per mask); the student is trained from scratch on them, cut at random lengths.
 --reliable: the twin loss (and the standardisation of the targets) only counts pixels whose twin fit has a regional
 dispersion beta <= 1 s, the fits whose Tmax is identifiable (Sec. III-C of the paper); the volumes still use tmask.
 
@@ -47,12 +44,29 @@ from scipy.ndimage import gaussian_filter
 from scipy.stats import norm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "encoders"))
 from cnn_baseline import LENGTHS, net  # noqa: E402
 
 QS = np.linspace(0.05, 0.95, 11)
 TAUS = np.round(np.arange(0.02, 0.6, 0.02), 3)
 DS = np.round(np.arange(-2.0, 10.01, 0.25), 2)
 
+
+
+def _mk_net(a, F, cout):
+    """net() for the architecture --arch names, so infer/eval match what train built."""
+    arch = getattr(a, "arch", "unet")
+    if arch == "tsnet":
+        from tsnet import net_ts as mk
+    elif arch == "cbnet":
+        from cbnet import net_cb as mk
+    elif arch in ("duonet", "idnet"):
+        from duonet import net_duo as mk
+    elif arch == "calnet":
+        from calnet import net_cal as mk
+    else:
+        mk = net
+    return mk(F, cin=4 * F, cout=cout)
 
 def load(cnn, x):
     data = {}
@@ -110,17 +124,7 @@ def train(a):
             tslices = [(n, z) for n in tdata if tf.get(n, -1) != a.adapt_fold for z in range(tdata[n]["ctc"].shape[0])
                        if tdata[n]["tmask"][z].astype(np.float32).sum() > 50]
             print(f"adaptation: {len(tslices)} slices of {len({n for n, _ in tslices})} target patients (test half {a.adapt_fold} held out)", flush=True)
-        pseudo = {}
-        if a.pseudo:         # teacher mask probabilities on the full scans of the adaptation patients
-            teacher = net(F, cin=4 * F, cout=10).to(dev).eval()
-            teacher.load_state_dict(torch.load(Path(a.pseudo) / "at2d_fold0.pt", map_location=dev))
-            for n in sorted({n for n, _ in tslices}):
-                with torch.no_grad():
-                    pseudo[n] = torch.sigmoid(teacher(torch.as_tensor(inputs(tdata[n], tdata[n]["frames"])).to(dev))[:, 8:10]).cpu().numpy()
-            del teacher
-            conf = np.mean([np.mean(np.abs(pseudo[n][z] - 0.5) >= 0.4) for n, z in tslices])
-            print(f"pseudo-masks from {a.pseudo}: confident share {conf:.3f}", flush=True)
-        model = net(F, cin=4 * F, cout=8 + (2 if a.masks else 0)).to(dev)
+        model = _mk_net(a, F, 8 + (2 if a.masks else 0)).to(dev)
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
         steps = a.epochs * (len(slices) // a.bs)
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, 1e-3, total_steps=steps)
@@ -141,11 +145,7 @@ def train(a):
                     w = d[wk][z].astype(np.float32)
                     v = d["valid"][z].astype(np.float32)
                     y = np.stack([d["core"][z], d["hypo"][z]]).astype(np.float32) / np.maximum(v, 1e-3)
-                    v = np.stack([v, v])
-                    if is_target and a.pseudo:   # confident teacher pseudo-masks instead of the labels
-                        p = pseudo[n][z]
-                        y, v = (p > 0.5).astype(np.float32), v * (np.abs(p - 0.5) >= 0.4)
-                    elif is_target:        # no label on the new centre: twin loss only
+                    if is_target:          # no label on the new centre: twin loss only
                         v = np.zeros_like(v)
                     if rng.random() < 0.5:
                         x, t, w, y, v = x[..., ::-1], t[..., ::-1], w[..., ::-1], y[..., ::-1], v[..., ::-1]
@@ -158,7 +158,7 @@ def train(a):
                 loss = a.phys_weight * (nll * W[:, None]).sum() / W.sum().clamp_min(1) / 4
                 if a.masks:
                     bce = torch.nn.functional.binary_cross_entropy_with_logits(out[:, 8:10], Y, reduction="none")
-                    loss = loss + (bce * V).sum() / V.sum().clamp_min(1)
+                    loss = loss + (bce * V[:, None]).sum() / V.sum().clamp_min(1) / 2
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -191,7 +191,7 @@ def infer(a):
     if a.external:
         models = []
         for k in range(5):
-            m = net(F, cin=4 * F, cout=8 + (2 if a.masks else 0)).to(dev).eval()
+            m = _mk_net(a, F, 8 + (2 if a.masks else 0)).to(dev).eval()
             m.load_state_dict(torch.load(a.work / f"at2d_fold{k}.pt", map_location=dev))
             models.append((m, np.load(a.work / f"at2d_fold{k}_norm.npz")))
         for n, d in data.items():
@@ -216,7 +216,7 @@ def infer(a):
             print(n, "ok", flush=True)
         return
     for k in range(5):
-        model = net(F, cin=4 * F, cout=8 + (2 if a.masks else 0)).to(dev).eval()
+        model = _mk_net(a, F, 8 + (2 if a.masks else 0)).to(dev).eval()
         model.load_state_dict(torch.load(a.work / f"at2d_fold{k}.pt", map_location=dev))
         nz = np.load(a.work / f"at2d_fold{k}_norm.npz")
         for n, d in data.items():
@@ -353,8 +353,6 @@ def evaluate(a):
                             wid.append(float(np.expm1(hi) - np.expm1(max(lo, 0.0))))
                             cert.append(d3(pt[n][0], float(np.expm1(max(lo, 0.0)))) == d3(pt[n][0], float(np.expm1(hi))))
                         cert = np.array(cert)
-                        out.setdefault("sel", {}).setdefault(name, {})[f"{ref_kind}_{mode}_{Ls}"] = {
-                            str(n): [int(cert[i]), float(wid[i])] for i, n in enumerate(pats)}
                         res[f"{ref_kind}_{mode}"] = {
                             "cover": float(np.mean(cov)), "width_median_ml": float(np.median(wid)), "certain": float(cert.mean()),
                             "flip_certain": float(flip[cert].mean()) if cert.any() else None,
@@ -377,7 +375,6 @@ def main():
     p.add_argument("--adapt-x", help="train: twin-target dir of the new centre")
     p.add_argument("--adapt-folds", help="train: json patient -> half (0/1) of the new centre")
     p.add_argument("--adapt-fold", type=int, default=0, help="train: the test half, never used for adaptation")
-    p.add_argument("--pseudo", help="train: work dir of the source-trained control used as the teacher of pseudo-masks")
     p.add_argument("--reliable", action="store_true", help="train: weight the twin loss by trel (ROIs with beta <= 1 s) instead of tmask")
     p.add_argument("--swap", choices=("aif", "ctx", "both"), help="infer diagnostic: template AIF / tissue curve")
     p.add_argument("--swap-from", default="at2d24x")

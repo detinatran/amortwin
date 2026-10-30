@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "encoders"))
 from amortwin2d import inputs, load  # noqa: E402
 from at2d_tta import M0_GRID, SMOOTH, rebuild, shifted_aif  # noqa: E402
 
@@ -146,7 +147,16 @@ def train(a):
         np.savez(a.work / f"at2d_fold{k}_norm.npz", mu=mu, sd=sd)
         slices = [(n, z) for n in tr for z in range(data[n]["ctc"].shape[0])
                   if data[n]["tmask"][z].astype(np.float32).sum() > 50]
-        model = net(F, cin=4 * F, cout=8 + (2 if a.masks else 0)).to(dev)
+        mk = net
+        if getattr(a, "arch", "unet") == "tsnet":
+            from tsnet import net_ts as mk        # same trunk, a temporal front end before it
+        elif getattr(a, "arch", "unet") == "cbnet":
+            from cbnet import net_cb as mk        # same trunk, a curve-basis front end before it
+        elif getattr(a, "arch", "unet") in ("duonet", "idnet"):
+            from duonet import net_duo as mk      # same trunk, a spread head for the unidentified MTT
+        elif getattr(a, "arch", "unet") == "calnet":
+            from calnet import net_cal as mk      # same trunk, a calibrated mask head
+        model = mk(F, cin=4 * F, cout=8 + (2 if a.masks else 0)).to(dev)
         # one amplitude and one transit scale per patient, learned jointly with the network
         pats = sorted({n for n, _ in slices})
         pi = {n: i for i, n in enumerate(pats)}
@@ -186,9 +196,20 @@ def train(a):
                     z_ = (T - mu_t) / sd_t
                     nll = 0.5 * (lv + (z_ - m) ** 2 * torch.exp(-lv))
                     loss = loss + a.twin_weight * (nll * W[:, None]).sum() / W.sum().clamp_min(1) / 4
+                if getattr(a, "arch", "unet") in ("duonet", "idnet") and a.spread_weight:
+                    from duonet import spread_penalty
+                    loss = loss + a.spread_weight * spread_penalty(model.last_logs)
                 if a.masks:
                     bce = torch.nn.functional.binary_cross_entropy_with_logits(out[:, 8:10], Y, reduction="none")
                     loss = loss + (bce * V).sum() / V.sum().clamp_min(1)
+                    if getattr(a, "arch", "unet") == "calnet":
+                        # the readout is a volume, so train on the volume as well as per voxel
+                        from calnet import volume_loss, decisiveness
+                        vmask = V[:, :1]
+                        if a.vol_weight:
+                            loss = loss + a.vol_weight * volume_loss(out[:, 8:10], Y, vmask)
+                        if a.dec_weight:
+                            loss = loss + a.dec_weight * decisiveness(out[:, 8:10], vmask)
                 if a.rec_weight:                 # symbolic decoder on the observed part of each slice
                     rec, nrec = 0.0, 0
                     for j in range(X.shape[0]):
@@ -198,6 +219,12 @@ def train(a):
                             continue
                         th = (m[j] * sd_t[0, :, 0, 0][:, None, None] + mu_t[0, :, 0, 0][:, None, None])
                         th = th[:3].permute(1, 2, 0)[valid]              # (P, 3) = ln MTT, delay, ln CBV
+                        if getattr(a, "arch", "unet") in ("duonet", "idnet"):
+                            # ln MTT is not identified by a truncated curve (Sec. III-B), so the decoder
+                            # is handed a sample from the spread the network predicts for it, not a point.
+                            from duonet import sample_mtt
+                            ls_j = model.last_logs[j, 0][valid] * sd_t[0, 0, 0, 0]
+                            th = sample_mtt(th, ls_j, training=model.training)
                         cc = smooth_gpu(torch.as_tensor(C[j], device=dev).permute(1, 2, 0)[valid][:, :L], gk, gr)
                         aif = torch.as_tensor(AIF[j], dtype=torch.float32, device=dev).clone()
                         aif[L:] = 0
@@ -241,6 +268,14 @@ def main():
     p.add_argument("--bs", type=int, default=16)
     p.add_argument("--fold", type=int)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--vol-weight", type=float, default=0.3,
+                   help="calnet: weight of the volume loss, the quantity DEFUSE 3 actually reads")
+    p.add_argument("--dec-weight", type=float, default=0.05,
+                   help="calnet: weight of the penalty on undecided probability mass")
+    p.add_argument("--spread-weight", type=float, default=0.02,
+                   help="duonet: weight of the one-sided penalty that stops the MTT spread collapsing")
+    p.add_argument("--arch", choices=("unet", "tsnet", "cbnet", "duonet", "idnet", "calnet"), default="unet",
+                   help="encoder: the U-Net of cnn_baseline, or a temporal front end before the same trunk")
     p.add_argument("--external")
     p.add_argument("--ext-refs")
     p.add_argument("--level", type=float, default=0.8)
