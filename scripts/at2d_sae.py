@@ -127,6 +127,51 @@ def fit_scalars(theta, c, pix, aif, L):
     return best[1], best[2]
 
 
+def _resample_t(arr, step, axis=0):
+    """Keep every step-th frame along `axis`, linear interpolation back to the 1 s grid."""
+    F = arr.shape[axis]
+    keep = np.arange(0, F, step)
+    t = np.arange(F, dtype=np.float32)
+    idx = np.clip(np.searchsorted(keep.astype(np.float32), t, side="right") - 1, 0, len(keep) - 2)
+    t0, t1 = keep[idx].astype(np.float32), keep[idx + 1].astype(np.float32)
+    w = np.clip((t - t0) / np.maximum(t1 - t0, 1e-6), 0, 1)
+    sh = [1] * arr.ndim
+    sh[axis] = F
+    w = w.reshape(sh)
+    a0 = np.take(arr, keep[idx], axis=axis)
+    a1 = np.take(arr, keep[idx + 1], axis=axis)
+    return a0 * (1 - w) + a1 * w
+
+
+def acq_augment(x, c, F, rng):
+    """Acquisition augmentation on ONE slice: x (4F, S, S) the encoder input, c (F, S, S) the raw
+    curves the symbolic decoder rebuilds. Targets and masks are untouched.
+
+    Each perturbation targets a measured weakness of the single-centre training distribution:
+      * AIF jitter +-2 frames, encoder input only -- the U-Net's largest robustness hole (11.0 %
+        core drift under aif_late2) and AIF timing is centre-specific. The reconstruction keeps the
+        true AIF, so the decoder stays consistent and the encoder alone must become invariant.
+      * frame resampling at 2-3 s -- centres sample at different rates (frames2s/3s drifts 0.4-1.0 %
+        now, but the fine-grained stopping rule reads every length).
+    The spatial zoom lives in the batch loop (it must transform targets and masks identically).
+    """
+    if rng.random() < 0.3:                      # AIF mistiming, input only
+        k = int(rng.integers(1, 3)) * (1 if rng.random() < 0.5 else -1)
+        a = x[2 * F:3 * F]
+        out = np.zeros_like(a)
+        if k > 0:
+            out[k:] = a[:-k]
+        else:
+            out[:k] = a[-k:]
+        x = np.concatenate([x[:2 * F], out, x[3 * F:]], 0)
+    if rng.random() < 0.2:                      # coarser sampling, interpolated back
+        step = int(rng.integers(2, 4))
+        x = np.concatenate([_resample_t(x[:F], step), x[F:2 * F],
+                            _resample_t(x[2 * F:3 * F], step), _resample_t(x[3 * F:], step)], 0)
+        c = _resample_t(c, step)
+    return x, c
+
+
 def train(a):
     import torch
     torch.manual_seed(a.seed)
@@ -156,14 +201,53 @@ def train(a):
             from duonet import net_duo as mk      # same trunk, a spread head for the unidentified MTT
         elif getattr(a, "arch", "unet") == "calnet":
             from calnet import net_cal as mk      # same trunk, a calibrated mask head
+        elif getattr(a, "arch", "unet") == "marginnet":
+            from marginnet import net_margin as mk  # same trunk, trained on the decision margin
+        elif getattr(a, "arch", "unet") == "duonet2":
+            from duonet2 import net_duo2 as mk      # pooled temporal front end + learned temperature
+        elif getattr(a, "arch", "unet") == "duonet3":
+            from duonet3 import net_duo3 as mk      # the identifiability head, with its three faults fixed
+        elif getattr(a, "arch", "unet") == "gapnet":
+            from gapnet import net_gap as mk        # calnet's temperature plus one signed knob on the gap
+        elif getattr(a, "arch", "unet") == "floornet":
+            from floornet import net_floor as mk    # calnet's temperature; the mechanism is in the loss
+        elif getattr(a, "arch", "unet") == "finenet":
+            from finenet import net_fine as mk      # full-resolution fine path for the small cores
+        elif getattr(a, "arch", "unet") == "resunet":
+            from baselines import net_res as mk     # residual-encoder U-Net (nnU-Net style)
+        elif getattr(a, "arch", "unet") == "attunet":
+            from baselines import net_att as mk     # attention gates on skips (PerfU-Net style)
+        elif getattr(a, "arch", "unet") == "ssmnet":
+            from ssmnet import net_ssm as mk        # causal state-space front end, read out at the cut frame
+        elif getattr(a, "arch", "unet") == "fishernet":
+            from fishernet import FisherNet
+            # the refinement is `iters` Gauss-Newton steps; on the GPU one step already gives the
+            # full posterior widening (x1.95 vs x1.97 at three steps) at half the wall clock
+            def mk(F_, cin, cout, _it=getattr(a, "fisher_iters", 1)):
+                return FisherNet(F_, cin, cout, iters=_it)
+        elif getattr(a, "arch", "unet") == "ssmfisher":
+            from fishernet import FisherNet
+            from ssmnet import SSMNet
+
+            def mk(F_, cin, cout, _it=getattr(a, "fisher_iters", 1)):
+                return FisherNet(F_, cin, cout, inner=SSMNet(F_, cin, cout), iters=_it)
         model = mk(F, cin=4 * F, cout=8 + (2 if a.masks else 0)).to(dev)
+        # fishernet refines in physical units, so it needs the target normalisation the encoder was fitted with
+        if hasattr(model, "set_norm"):
+            model.set_norm(mu, sd)
         # one amplitude and one transit scale per patient, learned jointly with the network
         pats = sorted({n for n, _ in slices})
         pi = {n: i for i, n in enumerate(pats)}
         logA = torch.zeros(len(pats), device=dev, requires_grad=True)
         logM = torch.full((len(pats),), float(np.log(6.0)), device=dev, requires_grad=True)
         d0 = torch.zeros(len(pats), device=dev, requires_grad=True)
-        opt = torch.optim.AdamW(list(model.parameters()) + [logA, logM, d0], lr=1e-3, weight_decay=1e-4)
+        ldec = None
+        if getattr(a, "learned_decoder", False):
+            # the ablation that separates "a reconstruction objective" from "this transport model"
+            from learneddec import LearnedDecoder
+            ldec = LearnedDecoder(F).to(dev)
+        extra = list(ldec.parameters()) if ldec is not None else []
+        opt = torch.optim.AdamW(list(model.parameters()) + extra + [logA, logM, d0], lr=1e-3, weight_decay=1e-4)
         steps = a.epochs * (len(slices) // a.bs)
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, 1e-3, total_steps=steps)
         mu_t, sd_t = (torch.as_tensor(v, dtype=torch.float32, device=dev)[None, :, None, None] for v in (mu, sd))
@@ -172,7 +256,7 @@ def train(a):
         for ep in range(a.epochs):
             order = rng.permutation(len(slices))
             for b in range(len(slices) // a.bs):
-                X, T, W, Y, V, C, AIF, LS, PI = [], [], [], [], [], [], [], [], []
+                X, T, W, Y, V, C, AIF, LS, PI, PM = [], [], [], [], [], [], [], [], [], []
                 for i in order[b * a.bs:(b + 1) * a.bs]:
                     n, z = slices[i]
                     d = data[n]
@@ -186,22 +270,80 @@ def train(a):
                     c = d["ctc"][z].astype(np.float32)
                     if rng.random() < 0.5:        # the curves must follow the flip, or the decoder rebuilds
                         x, t, w, y, v, c = (u[..., ::-1] for u in (x, t, w, y, v, c))   # the wrong hemisphere
+                    if getattr(a, "acq_aug", False):
+                        x, c = acq_augment(np.ascontiguousarray(x), np.ascontiguousarray(c), F, rng)
                     X.append(x), T.append(t), W.append(w), Y.append(np.clip(y, 0, 1)), V.append(np.stack([v, v]))
                     C.append(np.ascontiguousarray(c)), AIF.append(d["aif"]), LS.append(L), PI.append(pi[n])
+                    PM.append(d["pixel_ml"])
                 X, T, W, Y, V = (torch.as_tensor(np.ascontiguousarray(np.stack(u))).to(dev) for u in (X, T, W, Y, V))
-                out = model(X)
+                if getattr(a, "acq_aug", False) and rng.random() < 0.3:
+                    sc = float(rng.uniform(0.8, 1.25))
+                    S_ = X.shape[-1]
+                    Cb = torch.as_tensor(np.ascontiguousarray(np.stack(C))).to(dev)
+                    def _zoom(u, mode):
+                        z = torch.nn.functional.interpolate(u, scale_factor=sc, mode=mode,
+                                                            **({"align_corners": False} if mode == "bilinear" else {}))
+                        if z.shape[-1] >= S_:
+                            o = (z.shape[-1] - S_) // 2
+                            return z[..., o:o + S_, o:o + S_]
+                        pad = S_ - z.shape[-1]
+                        l = pad // 2
+                        return torch.nn.functional.pad(z, (l, pad - l, l, pad - l))
+                    X, T, Cb = _zoom(X, "bilinear"), _zoom(T, "bilinear"), _zoom(Cb, "bilinear")
+                    Y = _zoom(Y, "nearest").clamp(0, 1)
+                    V = (_zoom(V, "nearest") > 0.5).float()
+                    W = _zoom(W[:, None], "nearest")[:, 0]
+                    C = [Cb[j].cpu().numpy() for j in range(Cb.shape[0])]
+                if getattr(a, "arch", "unet") in ("fishernet", "ssmfisher"):
+                    # the refiner must use the SAME transit scale the reconstruction loss rebuilds
+                    # with, or it optimises theta on one scale and is scored on another
+                    m0_b = torch.exp(logM[torch.as_tensor(PI, device=dev)].clamp(np.log(1.5), np.log(30.0)))
+                    out = model(X, m0_b)
+                else:
+                    out = model(X)
                 m, lv = out[:, :4], out[:, 4:8].clamp(-8, 6)
                 loss = 0.0
                 if a.twin_weight:
                     z_ = (T - mu_t) / sd_t
                     nll = 0.5 * (lv + (z_ - m) ** 2 * torch.exp(-lv))
                     loss = loss + a.twin_weight * (nll * W[:, None]).sum() / W.sum().clamp_min(1) / 4
+                if getattr(a, "arch", "unet") == "duonet3" and a.spread_weight:
+                    from duonet3 import spread_penalty as _sp3
+                    loss = loss + a.spread_weight * _sp3(model.last_logs)
                 if getattr(a, "arch", "unet") in ("duonet", "idnet") and a.spread_weight:
                     from duonet import spread_penalty
                     loss = loss + a.spread_weight * spread_penalty(model.last_logs)
                 if a.masks:
                     bce = torch.nn.functional.binary_cross_entropy_with_logits(out[:, 8:10], Y, reduction="none")
-                    loss = loss + (bce * V).sum() / V.sum().clamp_min(1)
+                    if getattr(a, "arch", "unet") == "duonet3":
+                        from duonet3 import mask_weight
+                        Vw = V * mask_weight(model.last_logs)
+                        loss = loss + (bce * Vw).sum() / Vw.sum().clamp_min(1)
+                    else:
+                        loss = loss + (bce * V).sum() / V.sum().clamp_min(1)
+                    if getattr(a, "arch", "unet") == "floornet" and a.floor_weight:
+                        # 63k voxels below p=0.02 contribute 3.02 of 18.28 ml, so the weighted sum
+                        # reads a floor no single voxel is responsible for; push that band to zero
+                        from floornet import floor_penalty
+                        loss = loss + a.floor_weight * floor_penalty(out[:, 8:10], V[:, :1], tau=a.floor_tau)
+                    if getattr(a, "arch", "unet") == "gapnet" and a.gap_weight:
+                        # a likelihood on hypo - core, the quantity 79 % of the flips turn on:
+                        # how uncertain the gap is, not a push on where it sits
+                        from gapnet import gap_nll
+                        loss = loss + a.gap_weight * gap_nll(
+                            out[:, 8:10], Y, V[:, :1], model.last_log_sd,
+                            pixel_ml=float(np.mean(PM)))
+                    if getattr(a, "arch", "unet") == "duonet2" and a.vol_weight:
+                        # relative, because the decisions are made on small lesions
+                        from duonet2 import relative_volume_loss
+                        loss = loss + a.vol_weight * relative_volume_loss(
+                            out[:, 8:10], Y, V[:, :1], pixel_ml=float(np.mean(PM)))
+                    if getattr(a, "arch", "unet") == "marginnet" and a.margin_weight:
+                        # DEFUSE 3 is a step function, so train where a flip is at stake
+                        from marginnet import decision_margin_loss
+                        pm_b = float(np.mean(PM))
+                        loss = loss + a.margin_weight * decision_margin_loss(
+                            out[:, 8:10], Y, V[:, :1], pixel_ml=pm_b)
                     if getattr(a, "arch", "unet") == "calnet":
                         # the readout is a volume, so train on the volume as well as per voxel
                         from calnet import volume_loss, decisiveness
@@ -219,6 +361,10 @@ def train(a):
                             continue
                         th = (m[j] * sd_t[0, :, 0, 0][:, None, None] + mu_t[0, :, 0, 0][:, None, None])
                         th = th[:3].permute(1, 2, 0)[valid]              # (P, 3) = ln MTT, delay, ln CBV
+                        if getattr(a, "arch", "unet") == "duonet3":
+                            from duonet3 import sample_mtt as _smtt3
+                            ls_j = model.last_logs[j, 0][valid] * sd_t[0, 0, 0, 0]
+                            th = _smtt3(th, ls_j, training=model.training)
                         if getattr(a, "arch", "unet") in ("duonet", "idnet"):
                             # ln MTT is not identified by a truncated curve (Sec. III-B), so the decoder
                             # is handed a sample from the spread the network predicts for it, not a point.
@@ -233,8 +379,12 @@ def train(a):
                             bq = (m[j, 3] * sd_t[0, 3, 0, 0] + mu_t[0, 3, 0, 0])[valid]
                         if a.peak_tmax:   # the fourth head is Tmax, tied to the rebuilt curve's peak time
                             tq = (m[j, 3] * sd_t[0, 3, 0, 0] + mu_t[0, 3, 0, 0])[valid]
-                        rec = rec + recon_loss(th, cc, aif, L, logA[PI[j]], logM[PI[j]], a.detach_mtt, bq, tq,
-                                               d0[PI[j]] if a.delay_offset else None)
+                        if ldec is not None:
+                            from learneddec import learned_recon_loss
+                            rec = rec + learned_recon_loss(ldec, th, cc, aif, L, logA[PI[j]])
+                        else:
+                            rec = rec + recon_loss(th, cc, aif, L, logA[PI[j]], logM[PI[j]], a.detach_mtt, bq, tq,
+                                                   d0[PI[j]] if a.delay_offset else None)
                         nrec += 1
                     if nrec:
                         loss = loss + a.rec_weight * rec / nrec
@@ -268,13 +418,29 @@ def main():
     p.add_argument("--bs", type=int, default=16)
     p.add_argument("--fold", type=int)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--margin-weight", type=float, default=1.0,
+                   help="marginnet: weight of the smooth DEFUSE 3 decision loss")
     p.add_argument("--vol-weight", type=float, default=0.3,
                    help="calnet: weight of the volume loss, the quantity DEFUSE 3 actually reads")
     p.add_argument("--dec-weight", type=float, default=0.05,
                    help="calnet: weight of the penalty on undecided probability mass")
     p.add_argument("--spread-weight", type=float, default=0.02,
                    help="duonet: weight of the one-sided penalty that stops the MTT spread collapsing")
-    p.add_argument("--arch", choices=("unet", "tsnet", "cbnet", "duonet", "idnet", "calnet"), default="unet",
+    p.add_argument("--learned-decoder", action="store_true",
+                   help="replace the symbolic decoder by a small MLP: isolates the transport model "
+                        "from the mere presence of a reconstruction objective")
+    p.add_argument("--acq-aug", action="store_true",
+                   help="acquisition augmentation: AIF jitter, frame resampling, spatial zoom")
+    p.add_argument("--floor-weight", type=float, default=0.5,
+                   help="floornet: weight of the confidence penalty on the rejected band")
+    p.add_argument("--floor-tau", type=float, default=0.05,
+                   help="floornet: the band p < tau the penalty acts on")
+    p.add_argument("--gap-weight", type=float, default=0.3,
+                   help="gapnet: weight of the Gaussian NLL on hypo - core")
+    p.add_argument("--fisher-iters", type=int, default=1,
+                   help="fishernet/ssmfisher: Gauss-Newton steps (1 keeps the mechanism at half the cost)")
+    p.add_argument("--arch", choices=("unet", "tsnet", "cbnet", "duonet", "idnet", "calnet", "marginnet", "duonet2", "duonet3",
+                                     "gapnet", "floornet", "finenet", "resunet", "attunet", "ssmnet", "fishernet", "ssmfisher"), default="unet",
                    help="encoder: the U-Net of cnn_baseline, or a temporal front end before the same trunk")
     p.add_argument("--external")
     p.add_argument("--ext-refs")

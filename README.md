@@ -50,6 +50,25 @@ thing, so a comparison isolates the change rather than the capacity.
 | `cbnet` | projection onto a learned gamma-variate basis before the trunk | perfusion curves are low-dimensional, so 12 bases suffice |
 | `duonet` | `ln MTT` emitted as a distribution and sampled for the decoder | a truncated curve does not identify MTT, so a point estimate overstates what is known |
 | `calnet` | learned temperature, a loss on the volume itself, a penalty on undecided probability | the readout is a weighted sum of probabilities, so its error is one of calibration |
+| `duonet3` | the MTT spread conditioned on the cut and used to weight the mask loss | the identifiability estimate should reach the readout, not sit beside it |
+| `gapnet` | an explicit gap between the two mask logits | agreement is decided by a margin, so widen it |
+| `floornet` | a penalty on probabilities that commit below a floor | undecided pixels are what move the volume |
+| `finenet` | a second pass refining the parameters at full resolution | the decoder sees a downsampled estimate |
+| `ssmnet` | a causal S4D front end over time | one pass can then serve every cut length |
+| `fishernet` | a Gauss-Newton refiner that widens the posterior by the Fisher information | the spread should follow the Cramer-Rao bound, not be learned |
+| `ssmfisher` | both of the above | — |
+| `attunet` | attention gates on the skip connections | the trunk, not the decoder, is what carries the result |
+| `resunet` | a pre-activation residual encoder | as above, with the family the ISLES'24 winners used |
+
+None of these beats the plain U-Net: within one centre every variant lands inside seed noise, and
+across centres the per-patient signed volume errors correlate at r = 0.76 to 0.82, so the variants
+behave as one model plus noise. They are published because the negative result is the point -- the
+decoder, not the encoder, is what transfers.
+
+`--learned-decoder` replaces the fixed transport model by an 8.1 k-parameter MLP of the same
+interface (same three per-pixel quantities, same AIF, same output curve). It separates "a
+reconstruction objective of any kind" from "this transport model specifically": it recovers part
+of the gain over the mask-only control and not the rest.
 
 ```bash
 python scripts/at2d_sae.py train <cnn_dir> <x_dir> scripts/learned_folds24.json work/ \

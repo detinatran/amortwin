@@ -53,6 +53,20 @@ DS = np.round(np.arange(-2.0, 10.01, 0.25), 2)
 
 
 
+
+def _fwd_chunked(model, x, dev, chunk=4):
+    """Run the model over the slices of one patient in chunks.
+
+    inference used to push a whole patient through in one call, which is fine for the U-Net but
+    runs a 12 GB card out of memory for an encoder that attends over time per pixel. The chunk size
+    only affects memory, never the result.
+    """
+    import torch
+    outs = []
+    for i in range(0, x.shape[0], chunk):
+        outs.append(model(x[i:i + chunk].to(dev)).cpu())
+    return torch.cat(outs, 0).numpy()
+
 def _mk_net(a, F, cout):
     """net() for the architecture --arch names, so infer/eval match what train built."""
     arch = getattr(a, "arch", "unet")
@@ -64,6 +78,34 @@ def _mk_net(a, F, cout):
         from duonet import net_duo as mk
     elif arch == "calnet":
         from calnet import net_cal as mk
+    elif arch == "marginnet":
+        from marginnet import net_margin as mk
+    elif arch == "duonet2":
+        from duonet2 import net_duo2 as mk
+    elif arch == "duonet3":
+        from duonet3 import net_duo3 as mk
+    elif arch == "gapnet":
+        from gapnet import net_gap as mk
+    elif arch == "floornet":
+        from floornet import net_floor as mk
+    elif arch == "finenet":
+        from finenet import net_fine as mk
+    elif arch == "resunet":
+        from baselines import net_res as mk
+    elif arch == "attunet":
+        from baselines import net_att as mk
+    elif arch == "ssmnet":
+        from ssmnet import net_ssm as mk
+    elif arch == "fishernet":
+        # iters must match what train built, or load_state_dict fails on step_raw/damp_raw
+        from fishernet import FisherNet
+        _it = getattr(a, "fisher_iters", 1)
+        return FisherNet(F, 4 * F, cout, iters=_it)
+    elif arch == "ssmfisher":
+        from fishernet import FisherNet
+        from ssmnet import SSMNet
+        _it = getattr(a, "fisher_iters", 1)
+        return FisherNet(F, 4 * F, cout, inner=SSMNet(F, 4 * F, cout), iters=_it)
     else:
         mk = net
     return mk(F, cin=4 * F, cout=cout)
@@ -201,7 +243,7 @@ def infer(a):
                 mus, vs, ps = [], [], []
                 for m, nz in models:
                     with torch.no_grad():
-                        o = m(torch.as_tensor(inputs(d, L)).to(dev)).cpu().numpy()
+                        o = _fwd_chunked(m, torch.as_tensor(inputs(d, L)), dev)
                     mus.append(o[:, :4] * nz["sd"][None, :, None, None] + nz["mu"][None, :, None, None])
                     vs.append((np.exp(0.5 * np.clip(o[:, 4:8], -8, 6)) * nz["sd"][None, :, None, None]) ** 2)
                     if a.masks:
@@ -226,7 +268,7 @@ def infer(a):
             for Ls in LENGTHS:
                 L = d["frames"] if Ls == "full" else int(Ls)
                 with torch.no_grad():
-                    o = model(torch.as_tensor(inputs(d, L)).to(dev)).cpu().numpy()
+                    o = _fwd_chunked(model, torch.as_tensor(inputs(d, L)), dev)
                 mu = o[:, :4] * nz["sd"][None, :, None, None] + nz["mu"][None, :, None, None]
                 sd = np.exp(0.5 * np.clip(o[:, 4:8], -8, 6)) * nz["sd"][None, :, None, None]
                 rec[f"mu_{Ls}"], rec[f"sd_{Ls}"] = mu.astype(np.float16), sd.astype(np.float16)
@@ -381,6 +423,11 @@ def main():
     p.add_argument("--shift", type=int, default=0, help="infer: drop the first k frames of every input (a later start)")
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--bs", type=int, default=16)
+    p.add_argument("--arch", choices=("unet", "tsnet", "cbnet", "duonet", "idnet", "calnet", "marginnet",
+                                     "duonet2", "duonet3", "gapnet", "floornet", "finenet", "resunet", "attunet", "ssmnet", "fishernet", "ssmfisher"), default="unet",
+                   help="encoder, matching what train built; _mk_net dispatches on it")
+    p.add_argument("--fisher-iters", type=int, default=1,
+                   help="fishernet/ssmfisher: Gauss-Newton steps; must match the trained checkpoint")
     p.add_argument("--fold", type=int)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--level", type=float, default=0.8)
