@@ -168,6 +168,11 @@ the first line; check it against 94 / 20.2 % for ISLES'18 and 145 / 91.7 % for I
 
 ## Typical run
 
+The voxelwise pipeline below reads the twin fits through the internal packages that produced
+them, so `export_pairs.py`, `amortized_train.py`, `prob_amortwin.py` and the other scripts in
+the first table import modules that are not part of this repository. The 2D models, the
+scorers and the baselines have no such dependency and run on the released code alone.
+
 ```bash
 python scripts/export_pairs.py <ISLES2024_root> <twin_out> pairs.npz --folds scripts/learned_folds24.json
 python scripts/amortized_train.py pairs.npz weights/ --trunc-min 25 --prob --augment
