@@ -13,68 +13,6 @@ is scored by its agreement with the vendor DEFUSE 3 thrombectomy decision.
 
 The numbers below are the ones reported in the accompanying paper, currently under review.
 
-## Layout
-
-| file | purpose |
-|---|---|
-| `scripts/amortized_model.py` | network, input builder (`make_inputs`), target sets |
-| `scripts/export_pairs.py` | training pairs from the twin fits of a cohort (curves, AIF, context, targets) |
-| `scripts/amortized_train.py` | training per patient fold: random truncation, Gaussian NLL, acquisition augmentation |
-| `scripts/prob_amortwin.py` | conformal calibration, posterior maps, volume quantiles, decision scoring |
-| `scripts/eval_prob_external.py` | agreement and calibration on an external cohort without retraining |
-| `scripts/robustness.py` | acquisition perturbations (frame rate, noise, late start, AIF shift) |
-| `scripts/phantom.py` | phantom with known parameters; conformal calibration against the truth |
-| `scripts/amortized_volumes.py` | core and hypoperfusion volume grids under truncation |
-| `scripts/eval_amortized.py` | lesion AUC of the maps |
-| `scripts/time_amortized.py` | run-time measurement |
-| `scripts/learned_folds24.json` | patient folds of ISLES'24 used for all cross-fitting |
-
-### 2D models
-
-The voxelwise model above is amortized over single curves. The models below work on a whole slice
-cut at `L` seconds and are the ones evaluated across centres.
-
-| file | purpose |
-|---|---|
-| `scripts/cnn_baseline.py` | the 2D U-Net trunk (48/96/192, bottleneck 384) and the curves-only baseline |
-| `scripts/amortwin2d.py` | AmorTwin-2D: the twin's fitted parameters as regression targets, plus inference and evaluation shared by every 2D arm |
-| `scripts/at2d_sae.py` | **AmorTwin** (`AT`): the twin's indicator-dilution model as a fixed, weight-free decoder inside the network; the encoder emits per-pixel (ln MTT, delay, ln CBV) and the decoder rebuilds the observed part of each curve |
-| `scripts/at2d_tta.py` | the decoder's rebuild/AIF-shift helpers, and test-time adaptation baselines |
-| `scripts/mvols_dir.py` | probability-weighted volumes `V = sum_v p(v) w(v)` from a prediction directory |
-
-### Encoder variants
-
-`scripts/encoders/` holds alternatives to the plain U-Net, selected with `--arch`. Each keeps the
-trunk of `cnn_baseline` unchanged -- same widths, normalisation, dropout and head -- and alters one
-thing, so a comparison isolates the change rather than the capacity.
-
-| `--arch` | what it changes | hypothesis it tests |
-|---|---|---|
-| `unet` | nothing (default) | — |
-| `tsnet` | attention along time, per pixel, before the trunk | the first conv mixes all 60 frames and loses curve shape |
-| `cbnet` | projection onto a learned gamma-variate basis before the trunk | perfusion curves are low-dimensional, so 12 bases suffice |
-| `duonet` | `ln MTT` emitted as a distribution and sampled for the decoder | a truncated curve does not identify MTT, so a point estimate overstates what is known |
-| `calnet` | learned temperature, a loss on the volume itself, a penalty on undecided probability | the readout is a weighted sum of probabilities, so its error is one of calibration |
-| `duonet3` | the MTT spread conditioned on the cut and used to weight the mask loss | the identifiability estimate should reach the readout, not sit beside it |
-| `gapnet` | an explicit gap between the two mask logits | agreement is decided by a margin, so widen it |
-| `floornet` | a penalty on probabilities that commit below a floor | undecided pixels are what move the volume |
-| `finenet` | a second pass refining the parameters at full resolution | the decoder sees a downsampled estimate |
-| `ssmnet` | a causal S4D front end over time | one pass can then serve every cut length |
-| `fishernet` | a Gauss-Newton refiner that widens the posterior by the Fisher information | the spread should follow the Cramer-Rao bound, not be learned |
-| `ssmfisher` | both of the above | — |
-| `attunet` | attention gates on the skip connections | the trunk, not the decoder, is what carries the result |
-| `resunet` | a pre-activation residual encoder | as above, with the family the ISLES'24 winners used |
-
-None of these beats the plain U-Net: within one centre every variant lands inside seed noise, and
-across centres the per-patient signed volume errors correlate at r = 0.76 to 0.82, so the variants
-behave as one model plus noise. They are published because the negative result is the point -- the
-decoder, not the encoder, is what transfers.
-
-`--learned-decoder` replaces the fixed transport model by an 8.1 k-parameter MLP of the same
-interface (same three per-pixel quantities, same AIF, same output curve). It separates "a
-reconstruction objective of any kind" from "this transport model specifically": it recovers part
-of the gain over the mask-only control and not the rest.
-
 ```bash
 python scripts/at2d_sae.py train <cnn_dir> <x_dir> scripts/learned_folds24.json work/ \
     --masks --fold 0 --epochs 60 --twin-weight 0 --arch calnet
@@ -157,22 +95,6 @@ python scripts/scoring/agree24_json.py rsaeF_s0 rsaeF_s1 rsaeF_s2  # reverse, al
 python scripts/scoring/agree24_thr.py rev_att_s0 rev_att_s1 rev_att_s2  # arms written by mvols_thr.py
 python scripts/scoring/cmp_vol.py                                 # EPPINN vs AT-S volumes
 ```
-
-| file | purpose |
-|---|---|
-| `scripts/scoring/agree18_json.py` | forward agreement on all 94 ISLES'18 slabs |
-| `scripts/scoring/agree24_json.py` | reverse agreement on all 145 ISLES'24 patients |
-| `scripts/scoring/agree24_thr.py` | the same from `thr24.json` (expected volumes) |
-| `scripts/scoring/agree18_adapt.py`, `agree24_adapt.py` | TTA arms, scored only on the half not adapted on |
-| `scripts/scoring/agree_fold0.py` | ISLES'24 fold 0 |
-| `scripts/scoring/ci_ld_vs_ats.py`, `ci_ld_rev.py` | paired bootstrap CIs over patients |
-| `scripts/scoring/cmp_vol.py` | EPPINN and AmorTwin-S volume error on identical patients |
-| `scripts/baselines/` | EPPINN conversion and the 4D mJ-Net port (see its README) |
-
-The ISLES'18 ids 1-94 overlap 15 of the ISLES'24 ids, so a scorer pointed at the wrong reference
-file silently scores the wrong patients. Each scorer prints its cohort size and always-YES rate as
-the first line; check it against 94 / 20.2 % for ISLES'18 and 145 / 91.7 % for ISLES'24.
-
 
 ## Dependencies
 
