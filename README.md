@@ -1,12 +1,17 @@
 # AmorTwin
 
-AmorTwin is an amortized posterior over the voxel parameters of a physics-based digital twin of
-cerebral CT perfusion. From a voxel concentration curve cut at any scan length, a dilated 1D CNN
-returns a Gaussian posterior over the twin's relative MTT, delay, relative CBV and Tmax. Combined
-with the twin's hypoperfusion and normalised conformal calibration of the volume posterior, it
-flags which truncated scans give a reliable thrombectomy (DEFUSE 3) decision.
+AmorTwin is a spatial network regularized by a fixed symbolic transport decoder, for lesion
+estimation on truncated cerebral CT perfusion. From a CTP slice observed up to any cut length, a
+shared U-Net encoder predicts core and hypoperfusion probabilities together with per-pixel
+transit-time, arrival-delay and blood-volume coordinates; a weight-free decoder, the reduced
+indicator-dilution model of the twin, rebuilds the observed part of each curve to constrain
+training. A Cramer-Rao analysis quantifies which twin parameters truncation leaves identifiable,
+and only those enter the decoder.
 
-The code is being released step by step together with the paper (in preparation).
+The model is trained on one centre and applied to another without target-cohort adaptation, and
+is scored by its agreement with the vendor DEFUSE 3 thrombectomy decision.
+
+The numbers below are the ones reported in the accompanying paper, currently under review.
 
 ## Layout
 
@@ -33,7 +38,7 @@ cut at `L` seconds and are the ones evaluated across centres.
 |---|---|
 | `scripts/cnn_baseline.py` | the 2D U-Net trunk (48/96/192, bottleneck 384) and the curves-only baseline |
 | `scripts/amortwin2d.py` | AmorTwin-2D: the twin's fitted parameters as regression targets, plus inference and evaluation shared by every 2D arm |
-| `scripts/at2d_sae.py` | **AmorTwin-S**: the twin's indicator-dilution model as a fixed, weight-free decoder inside the network; the encoder emits per-pixel (ln MTT, delay, ln CBV) and the decoder rebuilds the observed part of each curve |
+| `scripts/at2d_sae.py` | **AmorTwin** (`AT`): the twin's indicator-dilution model as a fixed, weight-free decoder inside the network; the encoder emits per-pixel (ln MTT, delay, ln CBV) and the decoder rebuilds the observed part of each curve |
 | `scripts/at2d_tta.py` | the decoder's rebuild/AIF-shift helpers, and test-time adaptation baselines |
 | `scripts/mvols_dir.py` | probability-weighted volumes `V = sum_v p(v) w(v)` from a prediction directory |
 
@@ -80,9 +85,9 @@ python scripts/at2d_sae.py train <cnn_dir> <x_dir> scripts/learned_folds24.json 
 Agreement with the vendor DEFUSE 3 decision (%), per cut length. **Forward** trains on ISLES'24
 and is applied to ISLES'18 (94 slabs, always-NO 79.8 %); **reverse** trains on ISLES'18 and is
 applied to all 145 ISLES'24 patients (always-YES 91.7 %). Subscripts are the seed SD. The twin is
-a *target* in AmorTwin-2D and a *decoder* in AmorTwin-S.
+a *target* in AmorTwin-2D and a *decoder* in AmorTwin.
 
-| direction | cut | CNN | control | TTA | filt | AT-2D | **AT-S** |
+| direction | cut | CNN | control | TTA | filt | AT-2D | **AT** |
 |---|---|---|---|---|---|---|---|
 | forward | 25 s | 88.7±0.9 | 88.7±1.3 | 92.2±2.2 | 91.5±1.1 | 93.4±0.4 | **94.3±0.5** |
 | forward | 30 s | 87.9±0.9 | 89.0±1.8 | 92.2±1.6 | 92.3±1.8 | 94.3±1.3 | **96.5±0.5** |
@@ -100,7 +105,7 @@ arms never see, and still do not close the gap.
 Keeping the decoder and swapping only the trunk changes little; replacing the symbolic decoder by
 a learned 8.1 k-parameter MLP of the same interface keeps the gain forward and loses it in reverse.
 
-| direction | cut | attention | residual | learned dec. | AT-S |
+| direction | cut | attention | residual | learned dec. | AT |
 |---|---|---|---|---|---|
 | forward | 25 s | 95.4±1.2 | 93.6±1.1 | 92.1±2.2 | 94.3±0.5 |
 | forward | 30 s | 96.5±1.6 | 94.3±1.2 | 90.4±2.1 | 96.5±0.5 |
@@ -109,24 +114,33 @@ a learned 8.1 k-parameter MLP of the same interface keeps the gain forward and l
 | reverse | 30 s | 92.6±0.4 | 89.9±1.0 | 83.2±12.4 | 91.7±0.4 |
 | reverse | 35 s | 92.2±0.8 | 88.7±4.2 | 80.9±12.4 | 91.8±0.5 |
 
+Table 4 of the paper reports this ablation without the attention arm, for space; the full set of
+arms is kept here because every arm was run and scored the same way.
+
 Forward uses five seeds for the learned decoder and three elsewhere; reverse uses three, and ten
-for AT-S and the control in the first table.
+for AT and the control in the first table.
 
 ### Against published methods
 
-Measured on the same 94 ISLES'18 slabs at the 30 s cut, on one RTX 3080 Ti. The per-scan
-physics-informed networks have no cross-centre quantity, so they cannot enter the table above.
+Measured on the same 94 ISLES'18 slabs at the 30 s cut, on one RTX 3080 Ti.
 
-| method | truncated | cross-centre | core | hypo vol. err | empty | time |
-|---|---|---|---|---|---|---|
-| SPPINN | no | no | yes | — | — | — |
-| ReSPPINN | no | no | yes | — | — | — |
-| PerfU-Net | no | yes | yes | — | — | — |
-| Truncated-CTP | yes | no | no | — | — | — |
-| EPPINN (our run) | yes | no | no | 1.9 ml | 5/94 | 150 s |
-| **AmorTwin-S** | yes | yes | yes | **1.2 ml** | **0/94** | **1.1 s** |
+| method | truncated | cross-centre | core | hypo vol. err | empty | agree. | time |
+|---|---|---|---|---|---|---|---|
+| SPPINN | no | no | yes | — | — | — | — |
+| ReSPPINN | no | no | yes | — | — | — | — |
+| PerfU-Net | no | yes | yes | — | — | — | — |
+| Truncated-CTP | yes | no | no | — | — | — | — |
+| HemoPIC (as AT-2D targets) | yes | yes | yes | — | — | 77.7 % | 1.1 s |
+| EPPINN (our run) | yes | no | no | 1.9 ml | 5/94 | — | 150 s |
+| **AmorTwin** | yes | yes | yes | **1.1 ml** | **0/94** | **91.7 %** | **1.1 s** |
 
-Dashes mark methods whose released code or reported cohort does not allow a measurement here.
+Volume error is the median absolute hypoperfused-volume error; `agree.` is reverse-transfer
+DEFUSE 3 agreement at 30 s. Dashes mark quantities a method does not produce: EPPINN emits no
+probability and so yields no DEFUSE 3 decision, and the per-scan networks have no cross-centre
+cohort to score. AmorTwin read out EPPINN's way (a hard threshold at 0.5 rather than the
+probability weighting used throughout) gives 1.2 ml, still below EPPINN's 1.9 ml.
+
+This is Table 3 of the paper, which lists only the rows with a measured number.
 
 ## Reproducing the numbers
 
@@ -180,7 +194,7 @@ python scripts/prob_amortwin.py calib pairs.npz weights/ work/
 python scripts/eval_prob_external.py <external_pairs.npz> weights/ work/calib.json out.json
 ```
 
-AmorTwin-S, trained on one centre and applied to another without retraining:
+AmorTwin, trained on one centre and applied to another without retraining:
 
 ```bash
 # train: the symbolic decoder is self-supervised, so --twin-weight 0 uses no twin fit at all
