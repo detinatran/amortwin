@@ -75,6 +75,90 @@ python scripts/at2d_sae.py train <cnn_dir> <x_dir> scripts/learned_folds24.json 
     --masks --fold 0 --epochs 60 --twin-weight 0 --arch calnet
 ```
 
+## Results
+
+Agreement with the vendor DEFUSE 3 decision (%), per cut length. **Forward** trains on ISLES'24
+and is applied to ISLES'18 (94 slabs, always-NO 79.8 %); **reverse** trains on ISLES'18 and is
+applied to all 145 ISLES'24 patients (always-YES 91.7 %). Subscripts are the seed SD. The twin is
+a *target* in AmorTwin-2D and a *decoder* in AmorTwin-S.
+
+| direction | cut | CNN | control | TTA | filt | AT-2D | **AT-S** |
+|---|---|---|---|---|---|---|---|
+| forward | 25 s | 88.7±0.9 | 88.7±1.3 | 92.2±2.2 | 91.5±1.1 | 93.4±0.4 | **94.3±0.5** |
+| forward | 30 s | 87.9±0.9 | 89.0±1.8 | 92.2±1.6 | 92.3±1.8 | 94.3±1.3 | **96.5±0.5** |
+| forward | 35 s | 86.2±1.9 | 88.3±2.6 | 91.5±1.8 | 91.9±1.0 | 94.3±0.5 | **94.3±0.5** |
+| reverse | 25 s | 58.2±14.4 | 83.9±7.5 | 83.7±2.1 | 85.8±4.1 | 75.4±11.6 | **92.3±0.9** |
+| reverse | 30 s | 70.6±7.8 | 85.6±4.8 | 87.8±1.4 | 89.1±2.0 | 77.7±10.5 | **91.7±0.4** |
+| reverse | 35 s | 69.0±11.6 | 85.9±5.6 | 89.2±2.0 | 89.8±1.4 | 77.7±9.4 | **91.8±0.5** |
+
+The same transport model, network and data give a 15-point spread in reverse depending only on
+whether the model is a target or a layer. `TTA` and `filt` are given target data the twin-informed
+arms never see, and still do not close the gap.
+
+### What carries the transfer
+
+Keeping the decoder and swapping only the trunk changes little; replacing the symbolic decoder by
+a learned 8.1 k-parameter MLP of the same interface keeps the gain forward and loses it in reverse.
+
+| direction | cut | attention | residual | learned dec. | AT-S |
+|---|---|---|---|---|---|
+| forward | 25 s | 95.4±1.2 | 93.6±1.1 | 92.1±2.2 | 94.3±0.5 |
+| forward | 30 s | 96.5±1.6 | 94.3±1.2 | 90.4±2.1 | 96.5±0.5 |
+| forward | 35 s | 95.0±0.6 | 92.9±0.6 | 90.4±2.5 | 94.3±0.5 |
+| reverse | 25 s | 92.2±0.8 | 88.3±1.9 | 76.6±10.7 | 92.3±0.9 |
+| reverse | 30 s | 92.6±0.4 | 89.9±1.0 | 83.2±12.4 | 91.7±0.4 |
+| reverse | 35 s | 92.2±0.8 | 88.7±4.2 | 80.9±12.4 | 91.8±0.5 |
+
+Forward uses five seeds for the learned decoder and three elsewhere; reverse uses three, and ten
+for AT-S and the control in the first table.
+
+### Against published methods
+
+Measured on the same 94 ISLES'18 slabs at the 30 s cut, on one RTX 3080 Ti. The per-scan
+physics-informed networks have no cross-centre quantity, so they cannot enter the table above.
+
+| method | truncated | cross-centre | core | hypo vol. err | empty | time |
+|---|---|---|---|---|---|---|
+| SPPINN | no | no | yes | — | — | — |
+| ReSPPINN | no | no | yes | — | — | — |
+| PerfU-Net | no | yes | yes | — | — | — |
+| Truncated-CTP | yes | no | no | — | — | — |
+| EPPINN (our run) | yes | no | no | 1.9 ml | 5/94 | 150 s |
+| **AmorTwin-S** | yes | yes | yes | **1.2 ml** | **0/94** | **1.1 s** |
+
+Dashes mark methods whose released code or reported cohort does not allow a measurement here.
+
+## Reproducing the numbers
+
+The scorers read the per-patient volumes an inference run writes (`mvols*.json`, or `thr24.json`
+from `mvols_thr.py`) and apply the DEFUSE 3 rule. Volumes are always probability-weighted,
+`V = sum_v p(v) w(v)`, never thresholded. Point `AMORTWIN_ROOT` at the directory holding the arm
+folders, `cnn18/`, `cnn24/` and `refs*.json`:
+
+```bash
+export AMORTWIN_ROOT=/path/to/work
+python scripts/scoring/agree18_json.py saeF_s0 saeF_s1 saeF_s2   # forward, ISLES'18
+python scripts/scoring/agree24_json.py rsaeF_s0 rsaeF_s1 rsaeF_s2  # reverse, all 145
+python scripts/scoring/agree24_thr.py rev_att_s0 rev_att_s1 rev_att_s2  # arms written by mvols_thr.py
+python scripts/scoring/cmp_vol.py                                 # EPPINN vs AT-S volumes
+```
+
+| file | purpose |
+|---|---|
+| `scripts/scoring/agree18_json.py` | forward agreement on all 94 ISLES'18 slabs |
+| `scripts/scoring/agree24_json.py` | reverse agreement on all 145 ISLES'24 patients |
+| `scripts/scoring/agree24_thr.py` | the same from `thr24.json` (expected volumes) |
+| `scripts/scoring/agree18_adapt.py`, `agree24_adapt.py` | TTA arms, scored only on the half not adapted on |
+| `scripts/scoring/agree_fold0.py` | ISLES'24 fold 0 |
+| `scripts/scoring/ci_ld_vs_ats.py`, `ci_ld_rev.py` | paired bootstrap CIs over patients |
+| `scripts/scoring/cmp_vol.py` | EPPINN and AmorTwin-S volume error on identical patients |
+| `scripts/baselines/` | EPPINN conversion and the 4D mJ-Net port (see its README) |
+
+The ISLES'18 ids 1-94 overlap 15 of the ISLES'24 ids, so a scorer pointed at the wrong reference
+file silently scores the wrong patients. Each scorer prints its cohort size and always-YES rate as
+the first line; check it against 94 / 20.2 % for ISLES'18 and 145 / 91.7 % for ISLES'24.
+
+
 ## Dependencies
 
 * Python 3.11+, PyTorch, NumPy, SciPy, nibabel (see `requirements.txt`).
