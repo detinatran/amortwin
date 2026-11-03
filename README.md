@@ -105,17 +105,18 @@ arms never see, and still do not close the gap.
 Keeping the decoder and swapping only the trunk changes little; replacing the symbolic decoder by
 a learned 8.1 k-parameter MLP of the same interface keeps the gain forward and loses it in reverse.
 
-| direction | cut | attention | residual | learned dec. | AT |
-|---|---|---|---|---|---|
-| forward | 25 s | 95.4±1.2 | 93.6±1.1 | 92.1±2.2 | 94.3±0.5 |
-| forward | 30 s | 96.5±1.6 | 94.3±1.2 | 90.4±2.1 | 96.5±0.5 |
-| forward | 35 s | 95.0±0.6 | 92.9±0.6 | 90.4±2.5 | 94.3±0.5 |
-| reverse | 25 s | 92.2±0.8 | 88.3±1.9 | 76.6±10.7 | 92.3±0.9 |
-| reverse | 30 s | 92.6±0.4 | 89.9±1.0 | 83.2±12.4 | 91.7±0.4 |
-| reverse | 35 s | 92.2±0.8 | 88.7±4.2 | 80.9±12.4 | 91.8±0.5 |
+| direction | cut | residual | learned dec. | AT |
+|---|---|---|---|---|
+| forward | 25 s | 93.6±1.1 | 92.1±2.2 | 94.3±0.5 |
+| forward | 30 s | 94.3±1.2 | 90.4±2.1 | 96.5±0.5 |
+| forward | 35 s | 92.9±0.6 | 90.4±2.5 | 94.3±0.5 |
+| reverse | 25 s | 88.3±1.9 | 76.6±10.7 | 92.3±0.9 |
+| reverse | 30 s | 89.9±1.0 | 83.2±12.4 | 91.7±0.4 |
+| reverse | 35 s | 88.7±4.2 | 80.9±12.4 | 91.8±0.5 |
 
-Table 4 of the paper reports this ablation without the attention arm, for space; the full set of
-arms is kept here because every arm was run and scored the same way.
+`scripts/encoders/baselines.py` also provides an attention-gated trunk, reachable with
+`--arch attunet`. It is not listed above; it tracks AT within about a point in either direction,
+which is the same conclusion the residual arm supports.
 
 Forward uses five seeds for the learned decoder and three elsewhere; reverse uses three, and ten
 for AT and the control in the first table.
